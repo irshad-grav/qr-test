@@ -1,35 +1,32 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useState } from 'react';
+import './App.css';
+import CodeScanner from './scanner';
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [lastResult, setLastResult] = useState<string>('');
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
+    <div className='min-h-screen bg-gray-50 p-4'>
+      <h1 className='mb-4 text-2xl font-semibold'>QR + Barcode Scanner</h1>
+
+      <CodeScanner
+        onResult={(text) => {
+          setLastResult(text);
+        }}
+        onError={(err) => {
+          console.error(err);
+          alert('Camera error. Check permissions and try again.');
+        }}
+      />
+
+      <div className='mt-4 rounded bg-white p-4 shadow'>
+        <h2 className='mb-2 text-lg font-medium'>Last result</h2>
+        <p className='font-mono break-all text-sm text-gray-800'>
+          {lastResult || '—'}
         </p>
       </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+    </div>
+  );
 }
 
-export default App
+export default App;

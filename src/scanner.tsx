@@ -36,23 +36,35 @@ const CodeScanner: FC<CodeScannerProps> = ({
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
   const mountedRef = useRef(true);
 
-  // Helper to fully stop any active stream
+  // Decode control flags
+  const pausedRef = useRef(false);
+  const lastResultAtRef = useRef(0);
+
   const stopActiveStream = (videoEl: HTMLVideoElement | null) => {
     const stream = (videoEl?.srcObject as MediaStream | null) ?? null;
     if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
-      if (videoEl) {
-        videoEl.srcObject = null;
-      }
+      stream.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      });
+      if (videoEl) videoEl.srcObject = null;
     }
   };
 
-  // Initialize camera reader once
   useEffect(() => {
     readerRef.current = new BrowserMultiFormatReader();
 
+    const onVis = () => {
+      pausedRef.current = document.hidden;
+    };
+    document.addEventListener('visibilitychange', onVis);
+
     return () => {
       mountedRef.current = false;
+      document.removeEventListener('visibilitychange', onVis);
       try {
         controlsRef.current?.stop();
       } finally {
@@ -61,53 +73,43 @@ const CodeScanner: FC<CodeScannerProps> = ({
     };
   }, []);
 
-  // Handle errors consistently
   const handleError = useCallback(
     (err: unknown) => {
       if (!mountedRef.current) return;
-
-      const error = err instanceof Error ? err : new Error(String(err));
-      console.error('CodeScanner error:', error);
-      onError?.(error);
+      const e = err instanceof Error ? err : new Error(String(err));
+      console.error('CodeScanner error:', e);
+      onError?.(e);
     },
     [onError]
   );
 
-  // Enumerate cameras with proper error handling
   const initDevices = useCallback(async () => {
     try {
-      // Request permission first to get device labels
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-        });
-        stream.getTracks().forEach((track) => track.stop());
+        const s = await navigator.mediaDevices.getUserMedia({ video: true });
+        s.getTracks().forEach((t) => t.stop());
       } catch {
-        // Permission denied or no camera - continue anyway
+        // ignore
       }
 
-      const allDevices = await navigator.mediaDevices.enumerateDevices();
-      const videoInputs = allDevices
+      const all = await navigator.mediaDevices.enumerateDevices();
+      const cams = all
         .filter((d) => d.kind === 'videoinput')
-        .map((d, idx) => ({
+        .map((d, i) => ({
           deviceId: d.deviceId,
-          label: d.label || `Camera ${idx + 1}`,
+          label: d.label || `Camera ${i + 1}`,
         }));
 
       if (!mountedRef.current) return;
-
-      setDevices(videoInputs);
-
-      if (videoInputs.length > 0) {
-        // Prefer back camera, otherwise use first available
-        const backCamera = videoInputs.find((d) =>
-          /back|rear|environment/i.test(d.label)
+      setDevices(cams);
+      if (cams.length > 0) {
+        const back = cams.find((d) => /back|rear|environment/i.test(d.label));
+        setSelectedDeviceId(
+          (prev) => prev || back?.deviceId || cams[0].deviceId
         );
-        const preferredId = backCamera?.deviceId || videoInputs[0].deviceId;
-        setSelectedDeviceId(preferredId);
       }
-    } catch (err) {
-      handleError(err);
+    } catch (e) {
+      handleError(e);
     }
   }, [handleError]);
 
@@ -115,224 +117,169 @@ const CodeScanner: FC<CodeScannerProps> = ({
     initDevices();
   }, [initDevices]);
 
-  // Detect torch support with better error handling
   const detectTorchSupport = useCallback(async () => {
     try {
       const stream = videoRef.current?.srcObject as MediaStream | null;
       const track = stream?.getVideoTracks()[0];
-
       if (!track || !mountedRef.current) {
         setTorchSupported(false);
         return;
       }
-
       let supported = false;
-
-      // Method 1: Check MediaTrackCapabilities
       if (track.getCapabilities) {
-        const capabilities = track.getCapabilities() as any;
-        supported = Boolean(capabilities?.torch);
+        const caps = track.getCapabilities() as any;
+        supported = Boolean(caps?.torch);
       }
-
-      // Method 2: ImageCapture API fallback
       if (!supported && 'ImageCapture' in window) {
         try {
-          const imageCapture = new (window as any).ImageCapture(track);
-          const photoCaps = await imageCapture.getPhotoCapabilities();
+          const ic = new (window as any).ImageCapture(track);
+          const photo = await ic.getPhotoCapabilities();
           supported =
-            Array.isArray(photoCaps?.fillLightMode) &&
-            (photoCaps.fillLightMode.includes('flash') ||
-              photoCaps.fillLightMode.includes('torch'));
+            Array.isArray(photo?.fillLightMode) &&
+            (photo.fillLightMode.includes('flash') ||
+              photo.fillLightMode.includes('torch'));
         } catch {
-          // ImageCapture not supported or failed
+          /* ignore */
         }
       }
-
-      if (mountedRef.current) {
-        setTorchSupported(supported);
-      }
+      if (mountedRef.current) setTorchSupported(supported);
     } catch {
-      if (mountedRef.current) {
-        setTorchSupported(false);
-      }
+      if (mountedRef.current) setTorchSupported(false);
     }
   }, []);
 
-  // Start scanning with better error handling and cleanup
-  const start = useCallback(
-    async (deviceId?: string) => {
-      if (!videoRef.current || !readerRef.current) return;
-      if (isStarting || isRunning) return;
+  const onDecode = useCallback(
+    (result: any, err: any) => {
+      if (!mountedRef.current || pausedRef.current) return;
 
-      const targetDeviceId = deviceId ?? selectedDeviceId;
-      if (!targetDeviceId) {
-        handleError(new Error('No camera device selected'));
-        return;
-      }
-
-      try {
-        setIsStarting(true);
-        setTorchOn(false);
-        setTorchSupported(false);
-
-        // Stop previous scanning and any active stream
-        controlsRef.current?.stop();
-        controlsRef.current = null;
-        stopActiveStream(videoRef.current);
-
-        const controls = await readerRef.current.decodeFromVideoDevice(
-          targetDeviceId,
-          videoRef.current,
-          (result, err) => {
-            if (!mountedRef.current) return;
-
-            if (result) {
-              onResult?.(result.getText(), result);
-              // Optional haptic feedback
-              if (
-                'vibrate' in navigator &&
-                typeof navigator.vibrate === 'function'
-              ) {
-                navigator.vibrate(60);
-              }
-            } else if (err && err.name !== 'NotFoundException') {
-              // Only log non-routine errors (NotFoundException is expected between scans)
-              console.debug('Scan error:', err.message);
-            }
+      if (result) {
+        const now = performance.now();
+        if (now - lastResultAtRef.current > 500) {
+          lastResultAtRef.current = now;
+          onResult?.(result.getText(), result);
+          if (
+            'vibrate' in navigator &&
+            typeof navigator.vibrate === 'function'
+          ) {
+            navigator.vibrate(30);
           }
-        );
-
-        if (!mountedRef.current) {
-          controls?.stop();
-          stopActiveStream(videoRef.current);
-          return;
         }
-
-        if (controls) {
-          controlsRef.current = controls;
-
-          // Force-attach stream and play (some browsers need this)
-          const tryPlay = async () => {
-            const video = videoRef.current!;
-            const stream = video.srcObject as MediaStream | null;
-
-            if (stream) {
-              video.srcObject = stream;
-            }
-
-            // Wait for metadata to ensure dimensions are known
-            await new Promise<void>((resolve) => {
-              if (video.readyState >= 1) {
-                resolve();
-              } else {
-                const onLoaded = () => {
-                  video.removeEventListener('loadedmetadata', onLoaded);
-                  resolve();
-                };
-                video.addEventListener('loadedmetadata', onLoaded, {
-                  once: true,
-                });
-              }
-            });
-
-            try {
-              await video.play();
-            } catch (e) {
-              // Autoplay might require a user gesture on some platforms.
-              console.debug(
-                'video.play() blocked, will require user gesture',
-                e
-              );
-            }
-          };
-
-          try {
-            await tryPlay();
-          } catch (e) {
-            console.debug('Video play attempt failed:', e);
-          }
-
-          setIsRunning(true);
-
-          // Detect torch capability after stream is established
-          setTimeout(() => {
-            if (mountedRef.current) {
-              detectTorchSupport();
-            }
-          }, 200);
-        } else {
-          throw new Error('Failed to start scanner controls');
-        }
-      } catch (err: any) {
-        // Optional fallback: retry with facingMode when deviceId fails
-        if (
-          err?.name === 'OverconstrainedError' ||
-          err?.name === 'NotFoundError'
-        ) {
-          try {
-            const controls = await readerRef.current.decodeFromConstraints(
-              {
-                audio: false,
-                video: { facingMode: { ideal: 'environment' } },
-              },
-              videoRef.current!,
-              (result, e) => {
-                if (result) {
-                  onResult?.(result.getText(), result);
-                } else if (e && e.name !== 'NotFoundException') {
-                  console.debug('Scan error:', e.message);
-                }
-              }
-            );
-
-            if (!mountedRef.current) {
-              controls?.stop();
-              stopActiveStream(videoRef.current);
-              return;
-            }
-
-            controlsRef.current = controls;
-
-            try {
-              await videoRef.current!.play();
-            } catch {
-              /* ignore */
-            }
-
-            setIsRunning(true);
-            setTimeout(() => {
-              if (mountedRef.current) detectTorchSupport();
-            }, 200);
-            return;
-          } catch (e2) {
-            // fall through to handleError below
-            handleError(e2);
-          }
-        } else {
-          handleError(err);
-        }
-
-        if (mountedRef.current) {
-          setIsRunning(false);
-        }
-      } finally {
-        if (mountedRef.current) {
-          setIsStarting(false);
-        }
+      } else if (err && err.name !== 'NotFoundException') {
+        // Log, but do not stop/restart
+        // console.debug('Non-notfound error:', err);
       }
     },
-    [
-      isStarting,
-      isRunning,
-      selectedDeviceId,
-      onResult,
-      handleError,
-      detectTorchSupport,
-    ]
+    [onResult]
   );
 
-  // Stop scanning with proper cleanup
+  const start = useCallback(async () => {
+    if (!videoRef.current || !readerRef.current) return;
+    if (isStarting || isRunning) return;
+
+    const deviceId = selectedDeviceId;
+    if (!deviceId) {
+      handleError(new Error('No camera device selected'));
+      return;
+    }
+
+    try {
+      setIsStarting(true);
+      setTorchOn(false);
+      setTorchSupported(false);
+      pausedRef.current = false;
+
+      controlsRef.current?.stop();
+      controlsRef.current = null;
+      stopActiveStream(videoRef.current);
+
+      // Force constraints mode with gentle frame rate to avoid flapping
+      const constraints: MediaStreamConstraints = {
+        audio: false,
+        video: {
+          deviceId: { exact: deviceId },
+          frameRate: { ideal: 24, max: 24 },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      };
+
+      let controls: IScannerControls | null = null;
+      try {
+        controls = await readerRef.current.decodeFromConstraints(
+          constraints,
+          videoRef.current,
+          onDecode
+        );
+      } catch (e: any) {
+        // Fallback: relax deviceId; prefer environment
+        if (e?.name === 'OverconstrainedError' || e?.name === 'NotFoundError') {
+          controls = await readerRef.current.decodeFromConstraints(
+            {
+              audio: false,
+              video: {
+                facingMode: { ideal: 'environment' },
+                frameRate: { ideal: 24, max: 24 },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              },
+            },
+            videoRef.current,
+            onDecode
+          );
+        } else {
+          throw e;
+        }
+      }
+
+      if (!mountedRef.current) {
+        controls?.stop();
+        stopActiveStream(videoRef.current);
+        return;
+      }
+      if (!controls) throw new Error('Failed to start scanner');
+
+      controlsRef.current = controls;
+
+      // Ensure the video actually plays
+      const video = videoRef.current;
+      await new Promise<void>((resolve) => {
+        if (video.readyState >= 1) resolve();
+        else {
+          const onLoaded = () => {
+            video.removeEventListener('loadedmetadata', onLoaded);
+            resolve();
+          };
+          video.addEventListener('loadedmetadata', onLoaded, { once: true });
+        }
+      });
+      try {
+        await video.play();
+      } catch {
+        /* might need gesture */
+      }
+
+      setIsRunning(true);
+
+      setTimeout(() => {
+        if (mountedRef.current) detectTorchSupport();
+      }, 300);
+    } catch (e) {
+      handleError(e);
+      if (mountedRef.current) setIsRunning(false);
+    } finally {
+      if (mountedRef.current) setIsStarting(false);
+    }
+  }, [
+    isStarting,
+    isRunning,
+    selectedDeviceId,
+    handleError,
+    detectTorchSupport,
+    onDecode,
+  ]);
+
   const stop = useCallback(() => {
+    pausedRef.current = true;
     controlsRef.current?.stop();
     controlsRef.current = null;
     stopActiveStream(videoRef.current);
@@ -341,80 +288,69 @@ const CodeScanner: FC<CodeScannerProps> = ({
     setTorchSupported(false);
   }, []);
 
-  // Auto-start when device changes
   useEffect(() => {
     if (!selectedDeviceId || !mountedRef.current) return;
+    // Delay start slightly to avoid flaps during device enumeration
+    const tid = setTimeout(() => start(), 120);
+    return () => clearTimeout(tid);
+  }, [selectedDeviceId, start]);
 
-    start(selectedDeviceId);
-
-    return () => {
-      stop();
-    };
-  }, [selectedDeviceId, start, stop]);
-
-  // Toggle torch with multiple fallback methods
   const toggleTorch = useCallback(async () => {
     if (!isRunning || !torchSupported) return;
-
     try {
       const stream = videoRef.current?.srcObject as MediaStream | null;
       const track = stream?.getVideoTracks()[0];
-
       if (!track) return;
 
-      const newTorchState = !torchOn;
-
-      // Method 1: MediaTrackConstraints
+      const next = !torchOn;
       try {
-        await track.applyConstraints({
-          advanced: [{ torch: newTorchState } as any],
-        });
-
-        if (mountedRef.current) {
-          setTorchOn(newTorchState);
-        }
+        await track.applyConstraints({ advanced: [{ torch: next } as any] });
+        if (mountedRef.current) setTorchOn(next);
         return;
-      } catch (constraintsError) {
-        console.debug('Constraints method failed:', constraintsError);
+      } catch {
+        // fallback
       }
 
-      // Method 2: ImageCapture API fallback
       if ('ImageCapture' in window) {
         try {
-          const imageCapture = new (window as any).ImageCapture(track);
-          if (imageCapture.setOptions) {
-            await imageCapture.setOptions({
-              fillLightMode: newTorchState ? 'flash' : 'off',
+          const ic = new (window as any).ImageCapture(track);
+          if (ic.setOptions) {
+            await ic.setOptions({
+              fillLightMode: next ? 'flash' : 'off',
             });
-
-            if (mountedRef.current) {
-              setTorchOn(newTorchState);
-            }
+            if (mountedRef.current) setTorchOn(next);
             return;
           }
-        } catch (imageCaptureError) {
-          console.debug('ImageCapture method failed:', imageCaptureError);
+        } catch {
+          /* ignore */
         }
       }
 
       throw new Error('Torch control not supported');
-    } catch (err) {
-      handleError(err);
+    } catch (e) {
+      handleError(e);
     }
   }, [isRunning, torchSupported, torchOn, handleError]);
 
   const handleDeviceChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
-      setSelectedDeviceId(e.target.value);
+      const newId = e.target.value;
+      // Avoid double-binding by stopping first
+      if (isRunning || isStarting) {
+        controlsRef.current?.stop();
+        controlsRef.current = null;
+        stopActiveStream(videoRef.current);
+        setIsRunning(false);
+      }
+      setSelectedDeviceId(newId);
     },
-    []
+    [isRunning, isStarting]
   );
 
   return (
     <div
       className={`w-full max-w-md mx-auto space-y-3 bg-white rounded-xl shadow p-4 ${className}`}
     >
-      {/* Camera Selection */}
       <div className='flex items-center gap-2'>
         <label className='text-sm font-medium text-gray-700'>
           Camera source
@@ -437,7 +373,6 @@ const CodeScanner: FC<CodeScannerProps> = ({
         </select>
       </div>
 
-      {/* Video Preview */}
       <div className='relative aspect-[3/4] w-full overflow-hidden rounded-lg bg-black'>
         <video
           ref={videoRef}
@@ -446,12 +381,9 @@ const CodeScanner: FC<CodeScannerProps> = ({
           playsInline
           autoPlay
         />
-        {/* Scanning overlay */}
         <div className='pointer-events-none absolute inset-0 flex items-center justify-center'>
           <div className='h-44 w-44 rounded-md border-2 border-white/80 shadow-lg' />
         </div>
-
-        {/* Status indicator */}
         {isRunning && (
           <div className='absolute top-2 right-2 bg-green-500 text-white px-2 py-1 rounded text-xs font-medium'>
             Scanning...
@@ -459,7 +391,6 @@ const CodeScanner: FC<CodeScannerProps> = ({
         )}
       </div>
 
-      {/* Controls */}
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <div className='flex items-center gap-2'>
           <button

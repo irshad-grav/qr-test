@@ -1,5 +1,10 @@
-// src/components/CodeScanner.tsx
-import React, { useEffect, useRef, useState } from 'react';
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  type FC,
+} from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
 import type { IScannerControls } from '@zxing/browser';
 
@@ -10,11 +15,11 @@ type CameraDevice = {
 
 type CodeScannerProps = {
   onResult?: (text: string, raw: unknown) => void;
-  onError?: (err: unknown) => void;
+  onError?: (err: Error) => void;
   className?: string;
 };
 
-const CodeScanner: React.FC<CodeScannerProps> = ({
+const CodeScanner: FC<CodeScannerProps> = ({
   onResult,
   onError,
   className = '',
@@ -29,227 +34,443 @@ const CodeScanner: React.FC<CodeScannerProps> = ({
 
   const controlsRef = useRef<IScannerControls | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  const mountedRef = useRef(true);
 
-  // Enumerate cameras and pre-request permission for labels
-  useEffect(() => {
-    const initDevices = async () => {
-      try {
-        await navigator.mediaDevices.getUserMedia({ video: true });
-      } catch {
-        // Ignore; labels may be blank if permission denied
+  // Helper to fully stop any active stream
+  const stopActiveStream = (videoEl: HTMLVideoElement | null) => {
+    const stream = (videoEl?.srcObject as MediaStream | null) ?? null;
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      if (videoEl) {
+        videoEl.srcObject = null;
       }
+    }
+  };
 
+  // Initialize camera reader once
+  useEffect(() => {
+    readerRef.current = new BrowserMultiFormatReader();
+
+    return () => {
+      mountedRef.current = false;
       try {
-        const allDevices = await navigator.mediaDevices.enumerateDevices();
-        const videoInputs = allDevices
-          .filter((d) => d.kind === 'videoinput')
-          .map((d, idx) => ({
-            deviceId: d.deviceId,
-            label: d.label || `Camera ${idx + 1}`,
-          }));
-
-        setDevices(videoInputs);
-
-        // Prefer a "back" camera if present
-        const preferredId =
-          videoInputs.find((d) => d.label.toLowerCase().includes('back'))
-            ?.deviceId || videoInputs[0]?.deviceId;
-
-        if (preferredId) setSelectedDeviceId(preferredId);
-      } catch (err) {
-        onError?.(err);
+        controlsRef.current?.stop();
+      } finally {
+        stopActiveStream(videoRef.current);
       }
     };
+  }, []);
 
+  // Handle errors consistently
+  const handleError = useCallback(
+    (err: unknown) => {
+      if (!mountedRef.current) return;
+
+      const error = err instanceof Error ? err : new Error(String(err));
+      console.error('CodeScanner error:', error);
+      onError?.(error);
+    },
+    [onError]
+  );
+
+  // Enumerate cameras with proper error handling
+  const initDevices = useCallback(async () => {
+    try {
+      // Request permission first to get device labels
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+        });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch {
+        // Permission denied or no camera - continue anyway
+      }
+
+      const allDevices = await navigator.mediaDevices.enumerateDevices();
+      const videoInputs = allDevices
+        .filter((d) => d.kind === 'videoinput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId,
+          label: d.label || `Camera ${idx + 1}`,
+        }));
+
+      if (!mountedRef.current) return;
+
+      setDevices(videoInputs);
+
+      if (videoInputs.length > 0) {
+        // Prefer back camera, otherwise use first available
+        const backCamera = videoInputs.find((d) =>
+          /back|rear|environment/i.test(d.label)
+        );
+        const preferredId = backCamera?.deviceId || videoInputs[0].deviceId;
+        setSelectedDeviceId(preferredId);
+      }
+    } catch (err) {
+      handleError(err);
+    }
+  }, [handleError]);
+
+  useEffect(() => {
     initDevices();
-  }, [onError]);
+  }, [initDevices]);
 
-  const detectTorchSupport = async () => {
+  // Detect torch support with better error handling
+  const detectTorchSupport = useCallback(async () => {
     try {
       const stream = videoRef.current?.srcObject as MediaStream | null;
       const track = stream?.getVideoTracks()[0];
-      if (!track) {
+
+      if (!track || !mountedRef.current) {
         setTorchSupported(false);
         return;
       }
 
-      // Check via MediaTrackCapabilities
-      const capabilities = track.getCapabilities
-        ? (track.getCapabilities() as any)
-        : null;
+      let supported = false;
 
-      // Some browsers expose "torch" in capabilities. If not, try ImageCapture.
-      let supported = !!capabilities?.torch;
+      // Method 1: Check MediaTrackCapabilities
+      if (track.getCapabilities) {
+        const capabilities = track.getCapabilities() as any;
+        supported = Boolean(capabilities?.torch);
+      }
 
+      // Method 2: ImageCapture API fallback
       if (!supported && 'ImageCapture' in window) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const imageCapture = new (window as any).ImageCapture(track);
         try {
+          const imageCapture = new (window as any).ImageCapture(track);
           const photoCaps = await imageCapture.getPhotoCapabilities();
-          // If device supports fillLightMode including "flash", torch usually works
-          supported = Array.isArray(photoCaps.fillLightMode)
-            ? photoCaps.fillLightMode.includes('flash') ||
-              photoCaps.fillLightMode.includes('torch')
-            : false;
+          supported =
+            Array.isArray(photoCaps?.fillLightMode) &&
+            (photoCaps.fillLightMode.includes('flash') ||
+              photoCaps.fillLightMode.includes('torch'));
         } catch {
-          // Ignore; not supported
+          // ImageCapture not supported or failed
         }
       }
 
-      setTorchSupported(!!supported);
+      if (mountedRef.current) {
+        setTorchSupported(supported);
+      }
     } catch {
-      setTorchSupported(false);
+      if (mountedRef.current) {
+        setTorchSupported(false);
+      }
     }
-  };
+  }, []);
 
-  // Start scanning with the selected device
-  const start = async (deviceId?: string) => {
-    if (!videoRef.current) return;
-    if (isStarting || isRunning) return;
+  // Start scanning with better error handling and cleanup
+  const start = useCallback(
+    async (deviceId?: string) => {
+      if (!videoRef.current || !readerRef.current) return;
+      if (isStarting || isRunning) return;
 
-    try {
-      setIsStarting(true);
-
-      // Stop previous
-      controlsRef.current?.stop();
-      controlsRef.current = null;
-
-      if (!readerRef.current) {
-        readerRef.current = new BrowserMultiFormatReader();
+      const targetDeviceId = deviceId ?? selectedDeviceId;
+      if (!targetDeviceId) {
+        handleError(new Error('No camera device selected'));
+        return;
       }
 
-      const controls = await readerRef.current.decodeFromVideoDevice(
-        deviceId ?? selectedDeviceId,
-        videoRef.current,
-        (result, err) => {
-          if (result) {
-            onResult?.(result.getText(), result);
-            // Optional haptic
-            if (navigator.vibrate) navigator.vibrate(60);
-          } else if (err) {
-            // Ignore frequent NotFoundException between frames
+      try {
+        setIsStarting(true);
+        setTorchOn(false);
+        setTorchSupported(false);
+
+        // Stop previous scanning and any active stream
+        controlsRef.current?.stop();
+        controlsRef.current = null;
+        stopActiveStream(videoRef.current);
+
+        const controls = await readerRef.current.decodeFromVideoDevice(
+          targetDeviceId,
+          videoRef.current,
+          (result, err) => {
+            if (!mountedRef.current) return;
+
+            if (result) {
+              onResult?.(result.getText(), result);
+              // Optional haptic feedback
+              if (
+                'vibrate' in navigator &&
+                typeof navigator.vibrate === 'function'
+              ) {
+                navigator.vibrate(60);
+              }
+            } else if (err && err.name !== 'NotFoundException') {
+              // Only log non-routine errors (NotFoundException is expected between scans)
+              console.debug('Scan error:', err.message);
+            }
           }
+        );
+
+        if (!mountedRef.current) {
+          controls?.stop();
+          stopActiveStream(videoRef.current);
+          return;
         }
-      );
 
-      if (controls) {
-        controlsRef.current = controls;
-        setIsRunning(true);
-        // After stream is live, detect torch capability
-        // Give the video a brief moment to attach stream
-        setTimeout(() => {
-          detectTorchSupport();
-        }, 150);
+        if (controls) {
+          controlsRef.current = controls;
+
+          // Force-attach stream and play (some browsers need this)
+          const tryPlay = async () => {
+            const video = videoRef.current!;
+            const stream = video.srcObject as MediaStream | null;
+
+            if (stream) {
+              video.srcObject = stream;
+            }
+
+            // Wait for metadata to ensure dimensions are known
+            await new Promise<void>((resolve) => {
+              if (video.readyState >= 1) {
+                resolve();
+              } else {
+                const onLoaded = () => {
+                  video.removeEventListener('loadedmetadata', onLoaded);
+                  resolve();
+                };
+                video.addEventListener('loadedmetadata', onLoaded, {
+                  once: true,
+                });
+              }
+            });
+
+            try {
+              await video.play();
+            } catch (e) {
+              // Autoplay might require a user gesture on some platforms.
+              console.debug(
+                'video.play() blocked, will require user gesture',
+                e
+              );
+            }
+          };
+
+          try {
+            await tryPlay();
+          } catch (e) {
+            console.debug('Video play attempt failed:', e);
+          }
+
+          setIsRunning(true);
+
+          // Detect torch capability after stream is established
+          setTimeout(() => {
+            if (mountedRef.current) {
+              detectTorchSupport();
+            }
+          }, 200);
+        } else {
+          throw new Error('Failed to start scanner controls');
+        }
+      } catch (err: any) {
+        // Optional fallback: retry with facingMode when deviceId fails
+        if (
+          err?.name === 'OverconstrainedError' ||
+          err?.name === 'NotFoundError'
+        ) {
+          try {
+            const controls = await readerRef.current.decodeFromConstraints(
+              {
+                audio: false,
+                video: { facingMode: { ideal: 'environment' } },
+              },
+              videoRef.current!,
+              (result, e) => {
+                if (result) {
+                  onResult?.(result.getText(), result);
+                } else if (e && e.name !== 'NotFoundException') {
+                  console.debug('Scan error:', e.message);
+                }
+              }
+            );
+
+            if (!mountedRef.current) {
+              controls?.stop();
+              stopActiveStream(videoRef.current);
+              return;
+            }
+
+            controlsRef.current = controls;
+
+            try {
+              await videoRef.current!.play();
+            } catch {
+              /* ignore */
+            }
+
+            setIsRunning(true);
+            setTimeout(() => {
+              if (mountedRef.current) detectTorchSupport();
+            }, 200);
+            return;
+          } catch (e2) {
+            // fall through to handleError below
+            handleError(e2);
+          }
+        } else {
+          handleError(err);
+        }
+
+        if (mountedRef.current) {
+          setIsRunning(false);
+        }
+      } finally {
+        if (mountedRef.current) {
+          setIsStarting(false);
+        }
       }
-    } catch (err) {
-      onError?.(err);
-      setIsRunning(false);
-    } finally {
-      setIsStarting(false);
-    }
-  };
+    },
+    [
+      isStarting,
+      isRunning,
+      selectedDeviceId,
+      onResult,
+      handleError,
+      detectTorchSupport,
+    ]
+  );
 
-  const stop = () => {
+  // Stop scanning with proper cleanup
+  const stop = useCallback(() => {
     controlsRef.current?.stop();
     controlsRef.current = null;
+    stopActiveStream(videoRef.current);
     setIsRunning(false);
     setTorchOn(false);
     setTorchSupported(false);
-  };
+  }, []);
 
-  // Restart when camera changes
+  // Auto-start when device changes
   useEffect(() => {
-    if (!selectedDeviceId) return;
-    start(selectedDeviceId);
-    return () => stop();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDeviceId]);
+    if (!selectedDeviceId || !mountedRef.current) return;
 
-  // Toggle torch if supported
-  const toggleTorch = async () => {
+    start(selectedDeviceId);
+
+    return () => {
+      stop();
+    };
+  }, [selectedDeviceId, start, stop]);
+
+  // Toggle torch with multiple fallback methods
+  const toggleTorch = useCallback(async () => {
+    if (!isRunning || !torchSupported) return;
+
     try {
       const stream = videoRef.current?.srcObject as MediaStream | null;
       const track = stream?.getVideoTracks()[0];
+
       if (!track) return;
 
-      // Apply constraints with "torch" advanced setting
-      await track.applyConstraints({
-        advanced: [{ torch: !torchOn }],
-      } as unknown as MediaTrackConstraints);
+      const newTorchState = !torchOn;
 
-      setTorchOn((v) => !v);
-    } catch {
-      // Some browsers require ImageCapture trick; fallback attempt:
+      // Method 1: MediaTrackConstraints
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const imageCapture = new (window as any).ImageCapture(
-          (videoRef.current?.srcObject as MediaStream).getVideoTracks()[0]
-        );
-        const next = !torchOn;
-        await imageCapture.setOptions?.({
-          fillLightMode: next ? 'flash' : 'off',
+        await track.applyConstraints({
+          advanced: [{ torch: newTorchState } as any],
         });
-        setTorchOn(next);
-      } catch {
-        // Torch not supported or user denied
-      }
-    }
-  };
 
-  const handleDeviceChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    setSelectedDeviceId(e.target.value);
-  };
+        if (mountedRef.current) {
+          setTorchOn(newTorchState);
+        }
+        return;
+      } catch (constraintsError) {
+        console.debug('Constraints method failed:', constraintsError);
+      }
+
+      // Method 2: ImageCapture API fallback
+      if ('ImageCapture' in window) {
+        try {
+          const imageCapture = new (window as any).ImageCapture(track);
+          if (imageCapture.setOptions) {
+            await imageCapture.setOptions({
+              fillLightMode: newTorchState ? 'flash' : 'off',
+            });
+
+            if (mountedRef.current) {
+              setTorchOn(newTorchState);
+            }
+            return;
+          }
+        } catch (imageCaptureError) {
+          console.debug('ImageCapture method failed:', imageCaptureError);
+        }
+      }
+
+      throw new Error('Torch control not supported');
+    } catch (err) {
+      handleError(err);
+    }
+  }, [isRunning, torchSupported, torchOn, handleError]);
+
+  const handleDeviceChange = useCallback(
+    (e: React.ChangeEvent<HTMLSelectElement>) => {
+      setSelectedDeviceId(e.target.value);
+    },
+    []
+  );
 
   return (
     <div
-      className={[
-        'w-full max-w-md mx-auto space-y-3',
-        'bg-white rounded-xl shadow p-4',
-        className,
-      ].join(' ')}
+      className={`w-full max-w-md mx-auto space-y-3 bg-white rounded-xl shadow p-4 ${className}`}
     >
+      {/* Camera Selection */}
       <div className='flex items-center gap-2'>
         <label className='text-sm font-medium text-gray-700'>
           Camera source
         </label>
         <select
-          className='flex-1 rounded border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500'
+          className='flex-1 rounded border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-100 disabled:cursor-not-allowed'
           value={selectedDeviceId}
           onChange={handleDeviceChange}
           disabled={devices.length === 0 || isStarting}
         >
-          {devices.length === 0 && <option>No camera found</option>}
-          {devices.map((d) => (
-            <option key={d.deviceId} value={d.deviceId}>
-              {d.label}
-            </option>
-          ))}
+          {devices.length === 0 ? (
+            <option>No camera found</option>
+          ) : (
+            devices.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label}
+              </option>
+            ))
+          )}
         </select>
       </div>
 
+      {/* Video Preview */}
       <div className='relative aspect-[3/4] w-full overflow-hidden rounded-lg bg-black'>
         <video
           ref={videoRef}
           className='h-full w-full object-cover'
           muted
           playsInline
+          autoPlay
         />
+        {/* Scanning overlay */}
         <div className='pointer-events-none absolute inset-0 flex items-center justify-center'>
-          <div className='h-44 w-44 rounded-md border-2 border-white/80' />
+          <div className='h-44 w-44 rounded-md border-2 border-white/80 shadow-lg' />
         </div>
+
+        {/* Status indicator */}
+        {isRunning && (
+          <div className='absolute top-2 right-2 bg-green-500 text-white px-2 py-1 rounded text-xs font-medium'>
+            Scanning...
+          </div>
+        )}
       </div>
 
+      {/* Controls */}
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <div className='flex items-center gap-2'>
           <button
-            className='rounded bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-700 disabled:opacity-50'
+            className='rounded bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
             onClick={() => start()}
             disabled={isStarting || isRunning || !selectedDeviceId}
           >
             {isStarting ? 'Starting...' : 'Start'}
           </button>
           <button
-            className='rounded bg-gray-200 px-4 py-2 hover:bg-gray-300 disabled:opacity-50'
+            className='rounded bg-gray-500 px-4 py-2 text-white hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
             onClick={stop}
             disabled={!isRunning}
           >
@@ -258,7 +479,7 @@ const CodeScanner: React.FC<CodeScannerProps> = ({
         </div>
 
         <button
-          className='rounded bg-amber-500 px-3 py-2 text-white hover:bg-amber-600 disabled:opacity-50'
+          className='rounded bg-amber-500 px-3 py-2 text-white hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
           onClick={toggleTorch}
           disabled={!isRunning || !torchSupported}
           title={
@@ -266,10 +487,13 @@ const CodeScanner: React.FC<CodeScannerProps> = ({
               ? 'Start camera to use torch'
               : !torchSupported
               ? 'Torch not supported on this device'
-              : 'Toggle torch'
+              : torchOn
+              ? 'Turn torch off'
+              : 'Turn torch on'
           }
+          aria-label={torchOn ? 'Turn torch off' : 'Turn torch on'}
         >
-          {torchOn ? 'Torch Off' : 'Torch On'}
+          {torchOn ? '🔦 Off' : '🔦 On'}
         </button>
       </div>
     </div>

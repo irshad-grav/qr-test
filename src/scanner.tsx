@@ -1,8 +1,9 @@
-import React, {
+import {
   useEffect,
   useRef,
   useState,
   useCallback,
+  useMemo,
   type FC,
 } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
@@ -19,6 +20,8 @@ type CodeScannerProps = {
   className?: string;
 };
 
+type CameraMode = 'back-main' | 'back-wide' | 'front' | 'auto'; // auto used for first startup/fallback
+
 const CodeScanner: FC<CodeScannerProps> = ({
   onResult,
   onError,
@@ -34,6 +37,8 @@ const CodeScanner: FC<CodeScannerProps> = ({
   const [permissionStatus, setPermissionStatus] = useState<
     'granted' | 'denied' | 'prompt' | 'unknown'
   >('unknown');
+
+  const [mode, setMode] = useState<CameraMode>('auto');
 
   const controlsRef = useRef<IScannerControls | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
@@ -80,156 +85,125 @@ const CodeScanner: FC<CodeScannerProps> = ({
     (err: unknown) => {
       if (!mountedRef.current) return;
       const e = err instanceof Error ? err : new Error(String(err));
-      console.error('CodeScanner error:', e);
-      console.error('Error details:', {
-        name: e.name,
-        message: e.message,
-        stack: e.stack,
-        permissionStatus,
-        devices: devices.length,
-        selectedDeviceId,
-        isStarting,
-        isRunning,
-      });
       onError?.(e);
     },
-    [
-      onError,
-      permissionStatus,
-      devices.length,
-      selectedDeviceId,
-      isStarting,
-      isRunning,
-    ]
+    [onError]
   );
 
   const checkPermissions = useCallback(async () => {
     try {
-      // Check if we can query permissions
       if (navigator.permissions && navigator.permissions.query) {
         const permission = await navigator.permissions.query({
           name: 'camera' as PermissionName,
         });
         setPermissionStatus(permission.state);
-
-        // Listen for permission changes
         permission.addEventListener('change', () => {
           setPermissionStatus(permission.state);
         });
-
         if (permission.state === 'denied') {
           throw new Error(
             'Camera permission denied. Please enable camera access in your browser settings.'
           );
         }
       }
-    } catch (e) {
-      console.warn('Could not check camera permissions:', e);
+    } catch {
+      // ignore
     }
+  }, []);
+
+  const categorizeCameras = useCallback((cams: CameraDevice[]) => {
+    // Heuristics: label parsing to prefer back/front and wide/main
+    const isBack = (s: string) =>
+      /back|rear|environment/i.test(s) ||
+      (/camera/i.test(s) && !/front|user|face/i.test(s));
+    const isFront = (s: string) => /front|user|face/i.test(s);
+    const isWide = (s: string) =>
+      /ultra|ultra-wide|ultrawide|wide|0\.5x|0,5x|0x5|0_5x/i.test(s);
+
+    const back = cams.filter((c) => isBack(c.label));
+    const front = cams.filter((c) => isFront(c.label));
+    const backWide = back.filter((c) => isWide(c.label));
+    const backMain = back.filter((c) => !isWide(c.label));
+
+    const pickBackMain = backMain[0] || back[0] || cams[0];
+    const pickBackWide = backWide[0] || null;
+    const pickFront = front[0] || null;
+
+    return { pickBackMain, pickBackWide, pickFront };
+  }, []);
+
+  const enumerateAfterAccess = useCallback(async () => {
+    const allAfter = await navigator.mediaDevices.enumerateDevices();
+    const camsAfter = allAfter
+      .filter((d) => d.kind === 'videoinput')
+      .map((d, i) => ({
+        deviceId: d.deviceId,
+        label: d.label || `Camera ${i + 1}`,
+      }));
+    return camsAfter;
   }, []);
 
   const initDevices = useCallback(async () => {
     try {
-      console.log('Starting device initialization...');
-
-      // First check permissions
       await checkPermissions();
 
-      // Check if mediaDevices is available
       if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
         throw new Error('Media devices API not supported in this browser.');
       }
 
-      console.log('Enumerating all devices...');
       const all = await navigator.mediaDevices.enumerateDevices();
-      console.log('All devices found:', all);
-
-      const cams = all
+      let cams = all
         .filter((d) => d.kind === 'videoinput')
         .map((d, i) => ({
           deviceId: d.deviceId,
           label: d.label || `Camera ${i + 1}`,
         }));
 
-      console.log('Video input devices found:', cams);
-
       if (!mountedRef.current) return;
 
       if (cams.length === 0) {
-        // Try to get camera access to trigger permission prompt
-        console.log(
-          'No cameras found, trying to get camera access to trigger permissions...'
-        );
         let testStream: MediaStream | null = null;
         try {
           testStream = await navigator.mediaDevices.getUserMedia({
-            video: true,
+            video: { facingMode: 'environment' },
+            audio: false,
           });
           setPermissionStatus('granted');
-          console.log('Camera access granted, re-enumerating devices...');
-
-          // Re-enumerate after getting permission
-          const allAfterPermission =
-            await navigator.mediaDevices.enumerateDevices();
-          const camsAfterPermission = allAfterPermission
-            .filter((d) => d.kind === 'videoinput')
-            .map((d, i) => ({
-              deviceId: d.deviceId,
-              label: d.label || `Camera ${i + 1}`,
-            }));
-
-          console.log('Cameras after permission:', camsAfterPermission);
-
-          if (camsAfterPermission.length > 0) {
-            const back = camsAfterPermission.find((d) =>
-              /back|rear|environment/i.test(d.label)
-            );
-            const newDeviceId =
-              back?.deviceId || camsAfterPermission[0].deviceId;
-            setSelectedDeviceId(newDeviceId);
-            setDevices(camsAfterPermission);
-            console.log('Selected device after permission:', newDeviceId);
-            return;
-          }
+          cams = await enumerateAfterAccess();
         } catch (e: any) {
-          console.error('Failed to get camera access:', e);
-          if (e.name === 'NotAllowedError') {
+          if (e?.name === 'NotAllowedError') {
             setPermissionStatus('denied');
             throw new Error(
               'Camera access denied. Please allow camera permissions and refresh the page.'
             );
-          } else if (e.name === 'NotFoundError') {
+          } else if (e?.name === 'NotFoundError') {
             throw new Error('No camera found on this device.');
-          } else if (e.name === 'NotSupportedError') {
+          } else if (e?.name === 'NotSupportedError') {
             throw new Error('Camera not supported on this device.');
           } else {
-            throw new Error(`Camera access failed: ${e.message}`);
+            throw new Error(`Camera access failed: ${e?.message || e}`);
           }
         } finally {
-          // Always stop the test stream
           if (testStream) {
-            testStream.getTracks().forEach((track) => track.stop());
+            testStream.getTracks().forEach((t) => t.stop());
           }
         }
 
-        throw new Error(
-          'No camera devices found even after permission request.'
-        );
+        if (cams.length === 0) {
+          throw new Error('No camera devices found even after permission.');
+        }
       }
 
-      // We have cameras, set them up
       setDevices(cams);
 
-      if (cams.length > 0) {
-        const back = cams.find((d) => /back|rear|environment/i.test(d.label));
-        const newDeviceId = back?.deviceId || cams[0].deviceId;
-        setSelectedDeviceId(newDeviceId);
-        console.log('Selected device:', newDeviceId);
-      }
+      // Initial selection heuristic
+      const { pickBackMain } = categorizeCameras(cams);
+      setSelectedDeviceId(pickBackMain.deviceId);
+      setMode('back-main');
     } catch (e) {
       handleError(e);
     }
-  }, [handleError, checkPermissions]);
+  }, [checkPermissions, enumerateAfterAccess, categorizeCameras, handleError]);
 
   useEffect(() => {
     initDevices();
@@ -283,153 +257,230 @@ const CodeScanner: FC<CodeScannerProps> = ({
           }
         }
       } else if (err && err.name !== 'NotFoundException') {
-        // Log, but do not stop/restart
-        // console.debug('Non-notfound error:', err);
+        // ignore transient errors
       }
     },
     [onResult]
   );
 
-  const start = useCallback(async () => {
-    if (!videoRef.current || !readerRef.current) return;
-    if (isStarting || isRunning) return;
+  // Determine available camera modes from discovered devices
+  const cameraAvailability = useMemo(() => {
+    const result = {
+      hasBackMain: false,
+      hasBackWide: false,
+      hasFront: false,
+      showSelector: false,
+    };
+    if (!devices || devices.length === 0) return result;
 
-    const deviceId = selectedDeviceId;
-    if (!deviceId) {
-      handleError(new Error('No camera device selected'));
-      return;
-    }
+    // Heuristics should mirror categorizeCameras
+    const isBack = (s: string) =>
+      /back|rear|environment/i.test(s) ||
+      (/camera/i.test(s) && !/front|user|face/i.test(s));
+    const isFront = (s: string) => /front|user|face/i.test(s);
+    const isWide = (s: string) =>
+      /ultra|ultra-wide|ultrawide|wide|0\.5x|0,5x|0x5|0_5x/i.test(s);
 
-    // Check permissions before starting
-    if (permissionStatus === 'denied') {
-      handleError(
-        new Error(
-          'Camera permission denied. Please allow camera access in your browser settings.'
-        )
-      );
-      return;
-    }
+    const backs = devices.filter((d) => isBack(d.label));
+    const fronts = devices.filter((d) => isFront(d.label));
+    const backWides = backs.filter((d) => isWide(d.label));
+    const backMains = backs.filter((d) => !isWide(d.label));
 
-    try {
-      setIsStarting(true);
-      setTorchOn(false);
-      setTorchSupported(false);
-      pausedRef.current = false;
+    result.hasFront = fronts.length > 0;
+    result.hasBackMain = backMains.length > 0;
+    result.hasBackWide = backWides.length > 0;
 
-      controlsRef.current?.stop();
-      controlsRef.current = null;
-      stopActiveStream(videoRef.current);
+    const availableModesCount = [
+      result.hasBackMain,
+      result.hasBackWide,
+      result.hasFront,
+    ].filter(Boolean).length;
 
-      console.log('Starting scanner with device:', deviceId);
+    // Hide selector if only one physical camera or only one meaningful mode available
+    result.showSelector = devices.length > 1 && availableModesCount > 1;
+    return result;
+  }, [devices]);
 
-      // Force constraints mode with gentle frame rate to avoid flapping
-      const constraints: MediaStreamConstraints = {
+  const buildConstraints = useCallback(
+    (desiredMode: CameraMode, deviceId?: string): MediaStreamConstraints => {
+      // Strategy:
+      // - Prefer deviceId if provided (Android/Chrome and many Android browsers)
+      // - For iOS/Safari, facingMode is often more reliable; deviceId switching
+      //   might not always work, but we'll still try when we have it.
+      const base = {
         audio: false,
         video: {
-          deviceId: { exact: deviceId },
           frameRate: { ideal: 24, max: 24 },
           width: { ideal: 1280 },
           height: { ideal: 720 },
-        },
+        } as MediaTrackConstraints,
       };
 
-      let controls: IScannerControls | null = null;
-      try {
-        console.log('Attempting to start with exact device constraints');
-        controls = await readerRef.current.decodeFromConstraints(
-          constraints,
-          videoRef.current,
-          onDecode
-        );
-      } catch (e: any) {
-        console.warn(
-          'Failed with exact device constraints, trying fallback:',
-          e.name
-        );
-        // Fallback: relax deviceId; prefer environment
-        if (e?.name === 'OverconstrainedError' || e?.name === 'NotFoundError') {
-          try {
-            controls = await readerRef.current.decodeFromConstraints(
-              {
-                audio: false,
-                video: {
-                  facingMode: { ideal: 'environment' },
-                  frameRate: { ideal: 24, max: 24 },
-                  width: { ideal: 1280 },
-                  height: { ideal: 720 },
-                },
-              },
-              videoRef.current,
-              onDecode
-            );
-            console.log('Successfully started with environment fallback');
-          } catch (fallbackError: any) {
-            console.warn(
-              'Environment fallback also failed:',
-              fallbackError.name
-            );
-            // Final fallback: any camera
-            controls = await readerRef.current.decodeFromConstraints(
-              {
-                audio: false,
-                video: true,
-              },
-              videoRef.current,
-              onDecode
-            );
-            console.log('Successfully started with basic fallback');
-          }
-        } else {
-          throw e;
+      const useFacingEnv = {
+        ...(base.video as any),
+        facingMode: 'environment',
+      };
+      const useFacingUser = { ...(base.video as any), facingMode: 'user' };
+
+      if (desiredMode === 'front') {
+        // Prefer deviceId if we know a front camera device
+        if (deviceId) {
+          return {
+            audio: false,
+            video: { ...(base.video as any), deviceId: { exact: deviceId } },
+          };
         }
+        return { audio: false, video: useFacingUser };
       }
 
-      if (!mountedRef.current) {
-        controls?.stop();
-        stopActiveStream(videoRef.current);
+      // back-main or back-wide or auto
+      if (deviceId) {
+        return {
+          audio: false,
+          video: { ...(base.video as any), deviceId: { exact: deviceId } },
+        };
+      }
+      return { audio: false, video: useFacingEnv };
+    },
+    []
+  );
+
+  const pickDeviceForMode = useCallback(
+    (desiredMode: CameraMode): string | undefined => {
+      if (devices.length === 0) return undefined;
+      const { pickBackMain, pickBackWide, pickFront } =
+        categorizeCameras(devices);
+
+      if (desiredMode === 'front') {
+        return pickFront?.deviceId || undefined;
+      }
+      if (desiredMode === 'back-wide') {
+        return pickBackWide?.deviceId || pickBackMain?.deviceId || undefined;
+      }
+      // back-main or auto
+      return pickBackMain?.deviceId || pickBackWide?.deviceId || undefined;
+    },
+    [devices, categorizeCameras]
+  );
+
+  const start = useCallback(
+    async (desiredMode: CameraMode = mode) => {
+      if (!videoRef.current || !readerRef.current) return;
+      if (isStarting || isRunning) return;
+
+      if (permissionStatus === 'denied') {
+        handleError(
+          new Error(
+            'Camera permission denied. Please allow camera access in your browser settings.'
+          )
+        );
         return;
       }
-      if (!controls) throw new Error('Failed to start scanner');
 
-      controlsRef.current = controls;
-
-      // Ensure the video actually plays
-      const video = videoRef.current;
-      await new Promise<void>((resolve) => {
-        if (video.readyState >= 1) resolve();
-        else {
-          const onLoaded = () => {
-            video.removeEventListener('loadedmetadata', onLoaded);
-            resolve();
-          };
-          video.addEventListener('loadedmetadata', onLoaded, { once: true });
-        }
-      });
       try {
-        await video.play();
-      } catch {
-        /* might need gesture */
+        setIsStarting(true);
+        setTorchOn(false);
+        setTorchSupported(false);
+        pausedRef.current = false;
+
+        controlsRef.current?.stop();
+        controlsRef.current = null;
+        stopActiveStream(videoRef.current);
+
+        const plannedDeviceId =
+          desiredMode === 'auto'
+            ? selectedDeviceId
+            : pickDeviceForMode(desiredMode) || selectedDeviceId;
+
+        const constraintsPrimary = buildConstraints(
+          desiredMode,
+          plannedDeviceId
+        );
+
+        let controls: IScannerControls | null = null;
+        try {
+          controls = await readerRef.current.decodeFromConstraints(
+            constraintsPrimary,
+            videoRef.current,
+            onDecode
+          );
+        } catch (e: any) {
+          // Fallbacks
+          try {
+            // Try facingMode-based fallback
+            const fallbackConstraints = buildConstraints(
+              desiredMode,
+              undefined
+            );
+            controls = await readerRef.current.decodeFromConstraints(
+              fallbackConstraints,
+              videoRef.current,
+              onDecode
+            );
+          } catch {
+            // Final basic fallback
+            controls = await readerRef.current.decodeFromConstraints(
+              { audio: false, video: true },
+              videoRef.current,
+              onDecode
+            );
+          }
+        }
+
+        if (!mountedRef.current) {
+          controls?.stop();
+          stopActiveStream(videoRef.current);
+          return;
+        }
+        if (!controls) throw new Error('Failed to start scanner');
+
+        controlsRef.current = controls;
+
+        const video = videoRef.current;
+        await new Promise<void>((resolve) => {
+          if (video.readyState >= 1) resolve();
+          else {
+            const onLoaded = () => {
+              video.removeEventListener('loadedmetadata', onLoaded);
+              resolve();
+            };
+            video.addEventListener('loadedmetadata', onLoaded, { once: true });
+          }
+        });
+        try {
+          await video.play();
+        } catch {
+          /* may require user gesture */
+        }
+
+        setIsRunning(true);
+
+        setTimeout(() => {
+          if (mountedRef.current) detectTorchSupport();
+        }, 300);
+
+        if (plannedDeviceId) setSelectedDeviceId(plannedDeviceId);
+        setMode(desiredMode === 'auto' ? 'back-main' : desiredMode);
+      } catch (e) {
+        handleError(e);
+        if (mountedRef.current) setIsRunning(false);
+      } finally {
+        if (mountedRef.current) setIsStarting(false);
       }
-
-      setIsRunning(true);
-
-      setTimeout(() => {
-        if (mountedRef.current) detectTorchSupport();
-      }, 300);
-    } catch (e) {
-      handleError(e);
-      if (mountedRef.current) setIsRunning(false);
-    } finally {
-      if (mountedRef.current) setIsStarting(false);
-    }
-  }, [
-    isStarting,
-    isRunning,
-    selectedDeviceId,
-    handleError,
-    detectTorchSupport,
-    onDecode,
-  ]);
+    },
+    [
+      isStarting,
+      isRunning,
+      permissionStatus,
+      handleError,
+      detectTorchSupport,
+      onDecode,
+      mode,
+      selectedDeviceId,
+      buildConstraints,
+      pickDeviceForMode,
+    ]
+  );
 
   const stop = useCallback(() => {
     pausedRef.current = true;
@@ -442,9 +493,9 @@ const CodeScanner: FC<CodeScannerProps> = ({
   }, []);
 
   useEffect(() => {
-    if (!selectedDeviceId || !mountedRef.current) return;
-    // Delay start slightly to avoid flaps during device enumeration
-    const tid = setTimeout(() => start(), 120);
+    if (!mountedRef.current) return;
+    if (!selectedDeviceId) return;
+    const tid = setTimeout(() => start('auto'), 120);
     return () => clearTimeout(tid);
   }, [selectedDeviceId, start]);
 
@@ -485,46 +536,95 @@ const CodeScanner: FC<CodeScannerProps> = ({
     }
   }, [isRunning, torchSupported, torchOn, handleError]);
 
-  const handleDeviceChange = useCallback(
-    (e: React.ChangeEvent<HTMLSelectElement>) => {
-      const newId = e.target.value;
-      // Avoid double-binding by stopping first
-      if (isRunning || isStarting) {
-        controlsRef.current?.stop();
-        controlsRef.current = null;
-        stopActiveStream(videoRef.current);
-        setIsRunning(false);
-      }
-      setSelectedDeviceId(newId);
-    },
-    [isRunning, isStarting]
-  );
+  // Button handlers for camera modes
+  const switchToBackMain = useCallback(() => {
+    stop();
+    start('back-main');
+  }, [start, stop]);
+
+  const switchToBackWide = useCallback(() => {
+    stop();
+    start('back-wide');
+  }, [start, stop]);
+
+  const switchToFront = useCallback(() => {
+    stop();
+    start('front');
+  }, [start, stop]);
+
+  const retryInit = useCallback(() => {
+    setDevices([]);
+    setSelectedDeviceId('');
+    setMode('auto');
+    initDevices();
+  }, [initDevices]);
 
   return (
     <div
       className={`w-full max-w-md mx-auto space-y-3 bg-white rounded-xl shadow p-4 ${className}`}
     >
-      <div className='flex items-center gap-2'>
-        <label className='text-sm font-medium text-gray-700'>
-          Camera source
-        </label>
-        <select
-          className='flex-1 rounded border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-100 disabled:cursor-not-allowed'
-          value={selectedDeviceId}
-          onChange={handleDeviceChange}
-          disabled={devices.length === 0 || isStarting}
-        >
-          {devices.length === 0 ? (
-            <option>No camera found</option>
-          ) : (
-            devices.map((d) => (
-              <option key={d.deviceId} value={d.deviceId}>
-                {d.label}
-              </option>
-            ))
-          )}
-        </select>
-      </div>
+      {/* Camera mode buttons */}
+      {cameraAvailability.showSelector && (
+        <div className='flex flex-wrap items-center gap-2'>
+          <span className='text-sm font-medium text-gray-700'>Camera mode</span>
+          <div className='flex flex-wrap gap-2'>
+            {cameraAvailability.hasBackMain && (
+              <button
+                className={`rounded px-3 py-2 text-sm text-white transition-colors ${
+                  mode === 'back-main'
+                    ? 'bg-indigo-700'
+                    : 'bg-indigo-600 hover:bg-indigo-700'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                onClick={switchToBackMain}
+                disabled={isStarting}
+                title='Back main camera'
+              >
+                Back (Main)
+              </button>
+            )}
+            {cameraAvailability.hasBackWide && (
+              <button
+                className={`rounded px-3 py-2 text-sm text-white transition-colors ${
+                  mode === 'back-wide'
+                    ? 'bg-teal-700'
+                    : 'bg-teal-600 hover:bg-teal-700'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                onClick={switchToBackWide}
+                disabled={isStarting}
+                title='Back wide/ultra-wide camera'
+              >
+                Back (Wide)
+              </button>
+            )}
+            {cameraAvailability.hasFront && (
+              <button
+                className={`rounded px-3 py-2 text-sm text-white transition-colors ${
+                  mode === 'front'
+                    ? 'bg-purple-700'
+                    : 'bg-purple-600 hover:bg-purple-700'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                onClick={switchToFront}
+                disabled={isStarting}
+                title='Front/selfie camera'
+              >
+                Front
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {(permissionStatus === 'denied' || devices.length === 0) && (
+        <div className='flex flex-wrap items-center gap-2'>
+          <button
+            className='rounded bg-orange-500 px-3 py-2 text-white hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
+            onClick={retryInit}
+            disabled={isStarting}
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       <div className='relative aspect-[3/4] w-full overflow-hidden rounded-lg bg-black'>
         <video
@@ -569,7 +669,7 @@ const CodeScanner: FC<CodeScannerProps> = ({
           <button
             className='rounded bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
             onClick={() => start()}
-            disabled={isStarting || isRunning || !selectedDeviceId}
+            disabled={isStarting || isRunning}
           >
             {isStarting ? 'Starting...' : 'Start'}
           </button>
@@ -580,32 +680,16 @@ const CodeScanner: FC<CodeScannerProps> = ({
           >
             Stop
           </button>
-          {(permissionStatus === 'denied' || devices.length === 0) && (
-            <button
-              className='rounded bg-orange-500 px-4 py-2 text-white hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
-              onClick={() => {
-                setDevices([]);
-                setSelectedDeviceId('');
-                initDevices();
-              }}
-              disabled={isStarting}
-            >
-              Retry
-            </button>
-          )}
           <button
             className='rounded bg-blue-500 px-4 py-2 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
             onClick={async () => {
               try {
-                console.log('Testing camera access...');
                 const stream = await navigator.mediaDevices.getUserMedia({
                   video: true,
                 });
-                console.log('Camera test successful:', stream);
                 alert('Camera test successful! Camera is working.');
                 stream.getTracks().forEach((track) => track.stop());
               } catch (e: any) {
-                console.error('Camera test failed:', e);
                 alert(`Camera test failed: ${e.message}`);
               }
             }}

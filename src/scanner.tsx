@@ -144,7 +144,36 @@ const CodeScanner: FC<CodeScannerProps> = ({
     const isWide = (s: string) =>
       /ultra|ultra-wide|ultrawide|wide|0\.5x|0,5x|0x5|0_5x/i.test(s);
 
-    const back = cams.filter((c) => isBack(c.label));
+    // Android/Chrome often exposes labels like "camera2 0", "camera2 2"
+    const getAndroidCameraIndex = (s: string): number | undefined => {
+      // matches camera2 0 / camera 0 / cam 0 / 0: ... at beginning
+      const m = s
+        .toLowerCase()
+        .match(/(?:\bcamera\d*\b|\bcam\b)[^0-9]*(\d{1,2})\b/);
+      if (m && m[1] != null) {
+        const n = parseInt(m[1], 10);
+        return Number.isFinite(n) ? n : undefined;
+      }
+      // also try prefix like "0:" or "1:"
+      const m2 = s.toLowerCase().match(/^\s*(\d{1,2})\s*[:\-]/);
+      if (m2 && m2[1] != null) {
+        const n = parseInt(m2[1], 10);
+        return Number.isFinite(n) ? n : undefined;
+      }
+      return undefined;
+    };
+
+    // Sort back cameras to prefer lower android camera index first (camera2 0)
+    const back = cams
+      .filter((c) => isBack(c.label))
+      .sort((a, b) => {
+        const ia = getAndroidCameraIndex(a.label);
+        const ib = getAndroidCameraIndex(b.label);
+        if (ia != null && ib != null) return ia - ib;
+        if (ia != null) return -1;
+        if (ib != null) return 1;
+        return 0;
+      });
     const front = cams.filter((c) => isFront(c.label));
     const backWide = back.filter((c) => isWide(c.label));
     const backMain = back.filter((c) => !isWide(c.label));

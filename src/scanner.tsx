@@ -157,7 +157,8 @@ const CodeScanner: FC<CodeScannerProps> = ({
   }, []);
 
   const probeDeviceInfo = useCallback(async (deviceId: string) => {
-    if (deviceInfoRef.current.has(deviceId)) return deviceInfoRef.current.get(deviceId)!;
+    if (deviceInfoRef.current.has(deviceId))
+      return deviceInfoRef.current.get(deviceId)!;
     let stream: MediaStream | null = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -169,13 +170,19 @@ const CodeScanner: FC<CodeScannerProps> = ({
       const caps = (track.getCapabilities?.() as any) || {};
       const info = {
         facingMode: (settings as any).facingMode as string | undefined,
-        zoomMax: typeof caps?.zoom?.max === 'number' ? caps.zoom.max : undefined,
-        zoomMin: typeof caps?.zoom?.min === 'number' ? caps.zoom.min : undefined,
+        zoomMax:
+          typeof caps?.zoom?.max === 'number' ? caps.zoom.max : undefined,
+        zoomMin:
+          typeof caps?.zoom?.min === 'number' ? caps.zoom.min : undefined,
       } as { facingMode?: string; zoomMax?: number; zoomMin?: number };
       deviceInfoRef.current.set(deviceId, info);
       return info;
     } catch {
-      const info = { facingMode: undefined, zoomMax: undefined, zoomMin: undefined };
+      const info = {
+        facingMode: undefined,
+        zoomMax: undefined,
+        zoomMin: undefined,
+      };
       deviceInfoRef.current.set(deviceId, info);
       return info;
     } finally {
@@ -442,7 +449,7 @@ const CodeScanner: FC<CodeScannerProps> = ({
       desiredMode: CameraMode,
       deviceList?: CameraDevice[]
     ): Promise<string | undefined> => {
-      const list = (deviceList && deviceList.length > 0) ? deviceList : devices;
+      const list = deviceList && deviceList.length > 0 ? deviceList : devices;
       if (!list || list.length === 0) return undefined;
 
       const { pickBackMain, pickBackWide, pickFront } = categorizeCameras(list);
@@ -461,13 +468,20 @@ const CodeScanner: FC<CodeScannerProps> = ({
       if (desiredMode === 'back-wide') {
         if (pickBackWide) return pickBackWide.deviceId;
         // disambiguate by zoom: wide lenses tend to have a lower max zoom
-        const candidates = list.filter((c) => /back|rear|environment/i.test(c.label) || !/front|user|face/i.test(c.label));
+        const candidates = list.filter(
+          (c) =>
+            /back|rear|environment/i.test(c.label) ||
+            !/front|user|face/i.test(c.label)
+        );
         if (candidates.length >= 2) {
           let chosen: { id: string; zoomMax: number } | null = null;
           for (const d of candidates) {
             const info = await probeDeviceInfo(d.deviceId);
-            const z = Number.isFinite(info.zoomMax as any) ? (info.zoomMax as number) : -1;
-            if (chosen === null || z < chosen.zoomMax) chosen = { id: d.deviceId, zoomMax: z };
+            const z = Number.isFinite(info.zoomMax as any)
+              ? (info.zoomMax as number)
+              : -1;
+            if (chosen === null || z < chosen.zoomMax)
+              chosen = { id: d.deviceId, zoomMax: z };
           }
           return chosen?.id || pickBackMain?.deviceId || undefined;
         }
@@ -478,13 +492,20 @@ const CodeScanner: FC<CodeScannerProps> = ({
       if (pickBackMain) return pickBackMain.deviceId;
       if (pickBackWide) return pickBackWide.deviceId;
       // disambiguate by zoom: main lens usually has higher max zoom
-      const candidates = list.filter((c) => /back|rear|environment/i.test(c.label) || !/front|user|face/i.test(c.label));
+      const candidates = list.filter(
+        (c) =>
+          /back|rear|environment/i.test(c.label) ||
+          !/front|user|face/i.test(c.label)
+      );
       if (candidates.length >= 2) {
         let chosen: { id: string; zoomMax: number } | null = null;
         for (const d of candidates) {
           const info = await probeDeviceInfo(d.deviceId);
-          const z = Number.isFinite(info.zoomMax as any) ? (info.zoomMax as number) : -1;
-          if (chosen === null || z > chosen.zoomMax) chosen = { id: d.deviceId, zoomMax: z };
+          const z = Number.isFinite(info.zoomMax as any)
+            ? (info.zoomMax as number)
+            : -1;
+          if (chosen === null || z > chosen.zoomMax)
+            chosen = { id: d.deviceId, zoomMax: z };
         }
         return chosen?.id || candidates[0]?.deviceId;
       }
@@ -523,7 +544,9 @@ const CodeScanner: FC<CodeScannerProps> = ({
             : await pickDeviceIdForMode(desiredMode);
         // For front mode, avoid falling back to a back camera deviceId
         const plannedDeviceId =
-          desiredMode === 'front' ? picked : picked || selectedDeviceId || undefined;
+          desiredMode === 'front'
+            ? picked
+            : picked || selectedDeviceId || undefined;
 
         const constraintsPrimary = buildConstraints(
           desiredMode,
@@ -591,7 +614,8 @@ const CodeScanner: FC<CodeScannerProps> = ({
         setTimeout(() => {
           if (!mountedRef.current) return;
           // Prefer using ZXing-provided switchTorch controls when available
-          const hasSwitch = typeof controlsRef.current?.switchTorch === 'function';
+          const hasSwitch =
+            typeof controlsRef.current?.switchTorch === 'function';
           if (hasSwitch) setTorchSupported(true);
           else detectTorchSupport();
         }, 300);

@@ -263,6 +263,42 @@ const CodeScanner: FC<CodeScannerProps> = ({
     [onResult]
   );
 
+  // Best-effort lens selection using zoom constraints (helps on Android)
+  const adjustLensForMode = useCallback(async (desiredMode: CameraMode) => {
+    try {
+      const stream = videoRef.current?.srcObject as MediaStream | null;
+      const track = stream?.getVideoTracks()[0];
+      if (!track || !track.getCapabilities || !track.applyConstraints) return;
+      const caps = track.getCapabilities() as any;
+      if (!caps) return;
+      const zoomCaps = caps.zoom;
+      const hasZoomRange =
+        typeof zoomCaps === 'object' &&
+        zoomCaps !== null &&
+        (typeof zoomCaps.min === 'number' || typeof zoomCaps.max === 'number');
+      if (!hasZoomRange) return;
+
+      const min = Number.isFinite(zoomCaps.min) ? zoomCaps.min : 0;
+      const max = Number.isFinite(zoomCaps.max) ? zoomCaps.max : 0;
+      const clamp = (v: number) => Math.max(min, Math.min(max, v));
+
+      if (desiredMode === 'back-wide') {
+        // Prefer minimum zoom to emulate ultrawide
+        await track.applyConstraints({
+          advanced: [{ zoom: clamp(min) as any }],
+        } as any);
+      } else if (desiredMode === 'back-main') {
+        // Prefer ~1x if available; otherwise midpoint
+        const target = min <= 1 && 1 <= max ? 1 : (min + max) / 2;
+        await track.applyConstraints({
+          advanced: [{ zoom: clamp(target) as any }],
+        } as any);
+      }
+    } catch {
+      // ignore best-effort errors
+    }
+  }, []);
+
   // Determine available camera modes from discovered devices
   const cameraAvailability = useMemo(() => {
     const result = {
@@ -300,6 +336,11 @@ const CodeScanner: FC<CodeScannerProps> = ({
     result.showSelector = devices.length > 1 && availableModesCount > 1;
     return result;
   }, [devices]);
+
+  const currentDeviceLabel = useMemo(() => {
+    if (!selectedDeviceId) return '';
+    return devices.find((d) => d.deviceId === selectedDeviceId)?.label || '';
+  }, [devices, selectedDeviceId]);
 
   const buildConstraints = useCallback(
     (desiredMode: CameraMode, deviceId?: string): MediaStreamConstraints => {
@@ -387,10 +428,15 @@ const CodeScanner: FC<CodeScannerProps> = ({
         controlsRef.current = null;
         stopActiveStream(videoRef.current);
 
-        const plannedDeviceId =
+        const picked =
           desiredMode === 'auto'
             ? selectedDeviceId
-            : pickDeviceForMode(desiredMode) || selectedDeviceId;
+            : pickDeviceForMode(desiredMode);
+        // For front mode, avoid falling back to a back camera deviceId
+        const plannedDeviceId =
+          desiredMode === 'front'
+            ? picked
+            : picked || selectedDeviceId || undefined;
 
         const constraintsPrimary = buildConstraints(
           desiredMode,
@@ -459,6 +505,14 @@ const CodeScanner: FC<CodeScannerProps> = ({
           if (mountedRef.current) detectTorchSupport();
         }, 300);
 
+        // Adjust zoom after stream is live to better match main/wide
+        setTimeout(() => {
+          if (!mountedRef.current) return;
+          void adjustLensForMode(
+            desiredMode === 'auto' ? 'back-main' : desiredMode
+          );
+        }, 350);
+
         if (plannedDeviceId) setSelectedDeviceId(plannedDeviceId);
         setMode(desiredMode === 'auto' ? 'back-main' : desiredMode);
       } catch (e) {
@@ -520,7 +574,7 @@ const CodeScanner: FC<CodeScannerProps> = ({
           const ic = new (window as any).ImageCapture(track);
           if (ic.setOptions) {
             await ic.setOptions({
-              fillLightMode: next ? 'flash' : 'off',
+              fillLightMode: next ? 'torch' : 'off',
             });
             if (mountedRef.current) setTorchOn(next);
             return;
@@ -567,47 +621,51 @@ const CodeScanner: FC<CodeScannerProps> = ({
       {cameraAvailability.showSelector && (
         <div className='flex flex-wrap items-center gap-2'>
           <span className='text-sm font-medium text-gray-700'>Camera mode</span>
-          <div className='flex flex-wrap gap-2'>
+          <div
+            className='inline-flex rounded-lg bg-gray-100 p-1 shadow-sm ring-1 ring-gray-200'
+            role='group'
+            aria-label='Camera mode'
+          >
             {cameraAvailability.hasBackMain && (
               <button
-                className={`rounded px-3 py-2 text-sm text-white transition-colors ${
+                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
                   mode === 'back-main'
-                    ? 'bg-indigo-700'
-                    : 'bg-indigo-600 hover:bg-indigo-700'
+                    ? 'bg-white text-gray-900 shadow'
+                    : 'text-gray-700 hover:bg-gray-200'
                 } disabled:opacity-50 disabled:cursor-not-allowed`}
                 onClick={switchToBackMain}
                 disabled={isStarting}
                 title='Back main camera'
               >
-                Back (Main)
+                🎥 Back
               </button>
             )}
             {cameraAvailability.hasBackWide && (
               <button
-                className={`rounded px-3 py-2 text-sm text-white transition-colors ${
+                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
                   mode === 'back-wide'
-                    ? 'bg-teal-700'
-                    : 'bg-teal-600 hover:bg-teal-700'
+                    ? 'bg-white text-gray-900 shadow'
+                    : 'text-gray-700 hover:bg-gray-200'
                 } disabled:opacity-50 disabled:cursor-not-allowed`}
                 onClick={switchToBackWide}
                 disabled={isStarting}
                 title='Back wide/ultra-wide camera'
               >
-                Back (Wide)
+                🔭 Wide
               </button>
             )}
             {cameraAvailability.hasFront && (
               <button
-                className={`rounded px-3 py-2 text-sm text-white transition-colors ${
+                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
                   mode === 'front'
-                    ? 'bg-purple-700'
-                    : 'bg-purple-600 hover:bg-purple-700'
+                    ? 'bg-white text-gray-900 shadow'
+                    : 'text-gray-700 hover:bg-gray-200'
                 } disabled:opacity-50 disabled:cursor-not-allowed`}
                 onClick={switchToFront}
                 disabled={isStarting}
                 title='Front/selfie camera'
               >
-                Front
+                🤳 Front
               </button>
             )}
           </div>
@@ -657,11 +715,31 @@ const CodeScanner: FC<CodeScannerProps> = ({
           )}
         </div>
 
-        {isRunning && (
+        {isStarting && (
+          <div className='absolute top-2 right-2 bg-yellow-500 text-white px-2 py-1 rounded text-xs font-medium animate-pulse'>
+            Starting...
+          </div>
+        )}
+        {isRunning && !isStarting && (
           <div className='absolute top-2 right-2 bg-green-500 text-white px-2 py-1 rounded text-xs font-medium'>
             Scanning...
           </div>
         )}
+
+        {/* Current mode/device info */}
+        <div className='absolute bottom-2 left-1/2 -translate-x-1/2 bg-black/50 text-white px-2 py-1 rounded text-[11px] font-medium backdrop-blur-sm'>
+          <span className='opacity-90'>Mode:</span>{' '}
+          <span>
+            {mode === 'front'
+              ? 'Front'
+              : mode === 'back-wide'
+              ? 'Back (Wide)'
+              : 'Back (Main)'}
+          </span>
+          {currentDeviceLabel && (
+            <span className='opacity-90'> · Using: {currentDeviceLabel}</span>
+          )}
+        </div>
       </div>
 
       <div className='flex flex-wrap items-center justify-between gap-2'>
@@ -693,7 +771,7 @@ const CodeScanner: FC<CodeScannerProps> = ({
                 alert(`Camera test failed: ${e.message}`);
               }
             }}
-            disabled={isStarting}
+            disabled={isStarting || isRunning}
           >
             Test Camera
           </button>
